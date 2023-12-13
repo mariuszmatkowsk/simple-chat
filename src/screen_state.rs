@@ -1,5 +1,5 @@
+use crossterm::{execute, terminal};
 use std::io::{self, stdout};
-use crossterm:: {execute, terminal};
 
 pub struct ScreenState;
 
@@ -21,4 +21,3 @@ impl Drop for ScreenState {
         });
     }
 }
-

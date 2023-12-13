@@ -1,11 +1,11 @@
 mod screen_state;
 
+use crossterm::event::{poll, read, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::style::{Color, Print, SetBackgroundColor, SetForegroundColor};
+use crossterm::{cursor, terminal};
 use crossterm::QueueableCommand;
-use crossterm::event::{ poll, read, Event, KeyEventKind, KeyModifiers, KeyCode };
-use crossterm::style::{ Print, Color, SetForegroundColor, SetBackgroundColor };
-use crossterm::{ terminal, cursor };
 use screen_state::ScreenState;
-use std::io::{ self, stdout, Write };
+use std::io::{self, stdout, Write};
 use std::time::Duration;
 
 #[derive(Clone, PartialEq)]
@@ -39,8 +39,12 @@ struct Buffer {
 
 impl Buffer {
     fn new(width: usize, height: usize) -> Self {
-        let cells = vec![Cell::default(); width*height];
-        Self { cells, width, height }
+        let cells = vec![Cell::default(); width * height];
+        Self {
+            cells,
+            width,
+            height,
+        }
     }
 
     fn put_cell(&mut self, ch: char, x: usize, y: usize, fg: Color, bg: Color) {
@@ -54,7 +58,7 @@ impl Buffer {
         let start_index = y * self.width + x;
         for (offset, ch) in chs.iter().enumerate() {
             if let Some(cell) = self.cells.get_mut(start_index + offset) {
-                *cell = Cell { ch: *ch, fg, bg };    
+                *cell = Cell { ch: *ch, fg, bg };
             } else {
                 break;
             }
@@ -70,9 +74,13 @@ impl Buffer {
             .enumerate()
             .filter(|(_, (a, b))| a != b)
             .map(|(i, (a, _))| {
-                let x = i%self.width;
-                let y = i/self.width;
-                Patch {cell: a.clone(), x, y}
+                let x = i % self.width;
+                let y = i / self.width;
+                Patch {
+                    cell: a.clone(),
+                    x,
+                    y,
+                }
             })
             .collect()
     }
@@ -88,7 +96,7 @@ impl Buffer {
         qc.queue(SetForegroundColor(curr_fg_color))?;
         qc.queue(SetBackgroundColor(curr_bg_color))?;
         qc.queue(cursor::MoveTo(0, 0))?;
-        for Cell { ch, fg, bg }in self.cells.iter() {
+        for Cell { ch, fg, bg } in self.cells.iter() {
             if curr_fg_color != *fg {
                 curr_fg_color = *fg;
                 qc.queue(SetForegroundColor(curr_fg_color))?;
@@ -106,14 +114,34 @@ impl Buffer {
     }
 }
 
-fn apply_patches(qc: &mut impl Write, patches: &Vec<Patch>) -> io::Result<()> {
-    for Patch { cell, x, y } in patches.iter() {
-        qc.queue(cursor::MoveTo(*x as u16, *y as u16))?;
-        qc.queue(SetForegroundColor(cell.fg))?;
-        qc.queue(SetBackgroundColor(cell.bg))?;
-        qc.queue(Print(cell.ch))?;
+fn apply_patches(qc: &mut impl QueueableCommand, patches: &[Patch]) -> io::Result<()> {
+    let mut fg_curr = Color::White;
+    let mut bg_curr = Color::Black;
+    let mut x_prev = 0;
+    let mut y_prev = 0;
+    qc.queue(SetForegroundColor(fg_curr))?;
+    qc.queue(SetBackgroundColor(bg_curr))?;
+    for Patch {
+        cell: Cell { ch, fg, bg },
+        x,
+        y,
+    } in patches
+    {
+        if !(y_prev == *y && x_prev + 1 == *x) {
+            qc.queue(cursor::MoveTo(*x as u16, *y as u16))?;
+        }
+        x_prev = *x;
+        y_prev = *y;
+        if fg_curr != *fg {
+            fg_curr = *fg;
+            qc.queue(SetForegroundColor(fg_curr))?;
+        }
+        if bg_curr != *bg {
+            bg_curr = *bg;
+            qc.queue(SetBackgroundColor(bg_curr))?;
+        }
+        qc.queue(Print(ch))?;
     }
-
     Ok(())
 }
 
@@ -141,7 +169,7 @@ impl Prompt {
 
     fn render(&self, buffer: &mut Buffer, x: usize, y: usize, w: usize) {
         let chars = &self.data;
-        buffer.put_cells(&chars, x, y, Color::White, Color::Black);
+        buffer.put_cells(chars, x, y, Color::White, Color::Black);
 
         for pos_x in chars.len()..w {
             buffer.put_cell(' ', pos_x, y, Color::White, Color::Black);
@@ -153,10 +181,20 @@ impl Prompt {
     }
 
     fn cursor_move_right(&mut self) {
-        self.cursor = if self.cursor == self.data.len() { self.cursor } else { self.cursor + 1 }; 
+        self.cursor = if self.cursor == self.data.len() {
+            self.cursor
+        } else {
+            self.cursor + 1
+        };
     }
 
-    fn sync_cursor_with_terminal(&self, qc: &mut impl Write, x: usize, y: usize, w: usize) -> io::Result<()> {
+    fn sync_cursor_with_terminal(
+        &self,
+        qc: &mut impl Write,
+        x: usize,
+        y: usize,
+        w: usize,
+    ) -> io::Result<()> {
         let cursor_x_pos = std::cmp::min(x + self.cursor, w);
         qc.queue(cursor::MoveTo(cursor_x_pos as u16, y as u16))?;
         Ok(())
@@ -167,15 +205,18 @@ impl Prompt {
     }
 }
 
+#[derive(Default)]
 struct ChatLog {
     data: Vec<String>,
 }
 
-impl Default for ChatLog {
-    fn default() -> Self {
-        Self { data: Vec::<String>::default() }
-    }
-}
+// impl Default for ChatLog {
+//     fn default() -> Self {
+//         Self {
+//             data: Vec::<String>::default(),
+//         }
+//     }
+// }
 
 impl ChatLog {
     fn insert(&mut self, line: String) {
@@ -185,7 +226,7 @@ impl ChatLog {
     fn render(&self, buffer: &mut Buffer, x: usize, y: usize) {
         for (dy, line) in self.data.iter().enumerate() {
             let line_chars: Vec<_> = line.chars().collect();
-            buffer.put_cells(&line_chars, x, y+dy, Color::White, Color::Black);
+            buffer.put_cells(&line_chars, x, y + dy, Color::White, Color::Black);
         }
     }
 }
@@ -201,7 +242,7 @@ fn status_bar(buffer: &mut Buffer, label: &str, x: usize, y: usize, w: usize) {
     }
 }
 
-fn main() -> io::Result<()>  {
+fn main() -> io::Result<()> {
     let _screen_state = ScreenState::enable();
     let mut stdout = stdout();
 
@@ -214,40 +255,47 @@ fn main() -> io::Result<()>  {
     let mut prev_screen_buffer = Buffer::new(w as usize, h as usize);
 
     let mut quit = false;
-    
 
     prev_screen_buffer.flush(&mut stdout)?;
     while !quit {
-       if poll(Duration::ZERO)? {
-           match read()? {
-               Event::Key(key_event) if key_event.kind == KeyEventKind::Press => { 
+        if poll(Duration::ZERO)? {
+            match read()? {
+                Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
                     match key_event.code {
                         KeyCode::Char(ch) => {
-                           if key_event.modifiers == KeyModifiers::CONTROL && ch == 'c' {
-                               quit = true;
-                           } else {
-                               prompt.insert(ch);
-                           }
-                        },
+                            if key_event.modifiers == KeyModifiers::CONTROL {
+                                match ch {
+                                    'c' => quit = true,
+                                    'h' => prompt.cursor_move_left(),
+                                    'l' => prompt.cursor_move_right(),
+                                    _ => (),
+                                }
+                            } else {
+                                prompt.insert(ch);
+                            }
+                        }
                         KeyCode::Enter => {
                             chat.insert(prompt.get());
                             prompt.clear();
-                        },
+                        }
                         KeyCode::Backspace => {
                             prompt.backspace();
-                        },
+                        }
                         KeyCode::Left => {
                             prompt.cursor_move_left();
                         }
                         KeyCode::Right => {
                             prompt.cursor_move_right();
-                        }   
-                       _ => (),
-                   }
-               },
-               // handle other events
-               _ => (),
-           }
+                        }
+                        KeyCode::Esc => {
+                            prompt.clear();
+                        }
+                        _ => (),
+                    }
+                }
+                // handle other events
+                _ => (),
+            }
         }
 
         screen_buffer.clear();
@@ -256,18 +304,20 @@ fn main() -> io::Result<()>  {
 
         chat.render(&mut screen_buffer, 0, 1);
 
-        if h.checked_sub(2).is_some() {
-            status_bar(&mut screen_buffer, "Online", 0, (h - 2).into(), w.into())
+        if let Some(y) = h.checked_sub(2) {
+            status_bar(&mut screen_buffer, "Online", 0, y.into(), w.into())
         }
 
-        if h.checked_sub(1).is_some() {
-            prompt.sync_cursor_with_terminal(&mut stdout, 0, (h - 1).into(), w.into())?;
-            prompt.render(&mut screen_buffer, 0, (h - 1).into() , w.into());
+        if let Some(y) = h.checked_sub(1) {
+            prompt.render(&mut screen_buffer, 0, y.into(), w.into());
         }
 
         let patches = screen_buffer.diff(&prev_screen_buffer);
-        
         apply_patches(&mut stdout, &patches)?;
+
+        if let Some(y) = h.checked_sub(1) {
+            prompt.sync_cursor_with_terminal(&mut stdout, 0, y.into(), w.into())?;
+        }
 
         stdout.flush()?;
 
