@@ -119,14 +119,14 @@ fn apply_patches(qc: &mut impl Write, patches: &Vec<Patch>) -> io::Result<()> {
 
 #[derive(Default)]
 struct Prompt {
-    data: String,
+    data: Vec<char>,
     cursor: usize,
 }
 
 impl Prompt {
     fn insert(&mut self, ch: char) {
+        self.data.insert(self.cursor, ch);
         self.cursor += 1;
-        self.data.push(ch);
     }
 
     fn backspace(&mut self) {
@@ -140,12 +140,20 @@ impl Prompt {
     }
 
     fn render(&self, buffer: &mut Buffer, x: usize, y: usize, w: usize) {
-        let chars: Vec<_> = self.data.chars().collect();
+        let chars = &self.data;
         buffer.put_cells(&chars, x, y, Color::White, Color::Black);
 
         for pos_x in chars.len()..w {
             buffer.put_cell(' ', pos_x, y, Color::White, Color::Black);
         }
+    }
+
+    fn cursor_move_left(&mut self) {
+        self.cursor = if self.cursor > 0 { self.cursor - 1 } else { 0 };
+    }
+
+    fn cursor_move_right(&mut self) {
+        self.cursor = if self.cursor == self.data.len() { self.cursor } else { self.cursor + 1 }; 
     }
 
     fn sync_cursor_with_terminal(&self, qc: &mut impl Write, x: usize, y: usize, w: usize) -> io::Result<()> {
@@ -155,7 +163,7 @@ impl Prompt {
     }
 
     fn get(&self) -> String {
-        self.data.clone()
+        self.data.iter().collect()
     }
 }
 
@@ -220,18 +228,24 @@ fn main() -> io::Result<()>  {
                            } else {
                                prompt.insert(ch);
                            }
-                       },
-                       KeyCode::Enter => {
-                           chat.insert(prompt.get());
-                           prompt.clear();
-                       },
-                       KeyCode::Backspace => {
-                           prompt.backspace();
-                       }
+                        },
+                        KeyCode::Enter => {
+                            chat.insert(prompt.get());
+                            prompt.clear();
+                        },
+                        KeyCode::Backspace => {
+                            prompt.backspace();
+                        },
+                        KeyCode::Left => {
+                            prompt.cursor_move_left();
+                        }
+                        KeyCode::Right => {
+                            prompt.cursor_move_right();
+                        }   
                        _ => (),
                    }
                },
-               // hande other events
+               // handle other events
                _ => (),
            }
         }
@@ -247,8 +261,8 @@ fn main() -> io::Result<()>  {
         }
 
         if h.checked_sub(1).is_some() {
-            prompt.render(&mut screen_buffer, 0, (h - 1).into() , w.into());
             prompt.sync_cursor_with_terminal(&mut stdout, 0, (h - 1).into(), w.into())?;
+            prompt.render(&mut screen_buffer, 0, (h - 1).into() , w.into());
         }
 
         let patches = screen_buffer.diff(&prev_screen_buffer);
