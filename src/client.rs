@@ -8,7 +8,7 @@ use screen_state::ScreenState;
 use std::io::{ self, stdout, Write };
 use std::time::Duration;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct Cell {
     ch: char,
     fg: Color,
@@ -23,6 +23,12 @@ impl Default for Cell {
             bg: Color::Black,
         }
     }
+}
+
+struct Patch {
+    cell: Cell,
+    x: usize,
+    y: usize,
 }
 
 struct Buffer {
@@ -55,13 +61,33 @@ impl Buffer {
         }
     }
 
+    fn diff(&mut self, other: &Self) -> Vec<Patch> {
+        assert!(self.width == other.width && self.height == other.height);
+
+        self.cells
+            .iter()
+            .zip(other.cells.iter())
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(i, (a, _))| {
+                let x = i%self.width;
+                let y = i/self.width;
+                Patch {cell: a.clone(), x, y}
+            })
+            .collect()
+    }
+
+    fn clear(&mut self) {
+        self.cells.fill(Cell::default());
+    }
+
     fn flush(&self, qc: &mut impl Write) -> io::Result<()> {
         let mut curr_fg_color = Color::White;
         let mut curr_bg_color = Color::Black;
+        qc.queue(terminal::Clear(terminal::ClearType::All))?;
         qc.queue(SetForegroundColor(curr_fg_color))?;
         qc.queue(SetBackgroundColor(curr_bg_color))?;
         qc.queue(cursor::MoveTo(0, 0))?;
-        qc.queue(terminal::Clear(terminal::ClearType::All))?;
         for Cell { ch, fg, bg }in self.cells.iter() {
             if curr_fg_color != *fg {
                 curr_fg_color = *fg;
@@ -80,26 +106,36 @@ impl Buffer {
     }
 }
 
-struct Prompt {
-    data: String,
+fn apply_patches(qc: &mut impl Write, patches: &Vec<Patch>) -> io::Result<()> {
+    for Patch { cell, x, y } in patches.iter() {
+        qc.queue(cursor::MoveTo(*x as u16, *y as u16))?;
+        qc.queue(SetForegroundColor(cell.fg))?;
+        qc.queue(SetBackgroundColor(cell.bg))?;
+        qc.queue(Print(cell.ch))?;
+    }
+
+    Ok(())
 }
 
-impl Default for Prompt {
-    fn default() -> Self {
-        Self { data: String::default() }
-    }
+#[derive(Default)]
+struct Prompt {
+    data: String,
+    cursor: usize,
 }
 
 impl Prompt {
     fn insert(&mut self, ch: char) {
+        self.cursor += 1;
         self.data.push(ch);
     }
 
     fn backspace(&mut self) {
+        self.cursor = if self.cursor > 1 { self.cursor - 1 } else { 0 };
         self.data.pop();
     }
 
     fn clear(&mut self) {
+        self.cursor = 0;
         self.data.clear();
     }
 
@@ -112,10 +148,15 @@ impl Prompt {
         }
     }
 
+    fn sync_cursor_with_terminal(&self, qc: &mut impl Write, x: usize, y: usize, w: usize) -> io::Result<()> {
+        let cursor_x_pos = std::cmp::min(x + self.cursor, w);
+        qc.queue(cursor::MoveTo(cursor_x_pos as u16, y as u16))?;
+        Ok(())
+    }
+
     fn get(&self) -> String {
         self.data.clone()
     }
-
 }
 
 struct ChatLog {
@@ -162,11 +203,12 @@ fn main() -> io::Result<()>  {
     let (w, h) = terminal::size()?;
 
     let mut screen_buffer = Buffer::new(w as usize, h as usize);
+    let mut prev_screen_buffer = Buffer::new(w as usize, h as usize);
 
     let mut quit = false;
     
 
-    screen_buffer.flush(&mut stdout)?;
+    prev_screen_buffer.flush(&mut stdout)?;
     while !quit {
        if poll(Duration::ZERO)? {
            match read()? {
@@ -194,19 +236,28 @@ fn main() -> io::Result<()>  {
            }
         }
 
+        screen_buffer.clear();
+
         status_bar(&mut screen_buffer, "simple-chat", 0, 0, w.into());
 
         chat.render(&mut screen_buffer, 0, 1);
 
         if h.checked_sub(2).is_some() {
-            status_bar(&mut screen_buffer, "Online", 0, (h-2).into(), w.into());
+            status_bar(&mut screen_buffer, "Online", 0, (h - 2).into(), w.into())
         }
 
         if h.checked_sub(1).is_some() {
-            prompt.render(&mut screen_buffer, 0, (h-1).into(), w.into());
+            prompt.render(&mut screen_buffer, 0, (h - 1).into() , w.into());
+            prompt.sync_cursor_with_terminal(&mut stdout, 0, (h - 1).into(), w.into())?;
         }
 
-        screen_buffer.flush(&mut stdout)?;
+        let patches = screen_buffer.diff(&prev_screen_buffer);
+        
+        apply_patches(&mut stdout, &patches)?;
+
+        stdout.flush()?;
+
+        std::mem::swap(&mut screen_buffer, &mut prev_screen_buffer);
 
         std::thread::sleep(Duration::from_millis(16));
     }
