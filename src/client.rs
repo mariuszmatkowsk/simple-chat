@@ -1,149 +1,21 @@
 mod screen_state;
+mod terminal_buffer;
 
-use crossterm::event::{poll, read, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::style::{Color, Print, SetBackgroundColor, SetForegroundColor};
-use crossterm::{cursor, terminal};
-use crossterm::QueueableCommand;
 use screen_state::ScreenState;
+
+use terminal_buffer::{apply_patches, TerminalBuffer};
+
+use crossterm::{
+    cursor,
+    event::{poll, read, Event, KeyCode, KeyEventKind, KeyModifiers},
+    style::Color,
+    terminal, QueueableCommand,
+};
+
 use std::io::{self, stdout, Write};
+
+use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
-
-#[derive(Clone, PartialEq)]
-struct Cell {
-    ch: char,
-    fg: Color,
-    bg: Color,
-}
-
-impl Default for Cell {
-    fn default() -> Self {
-        Self {
-            ch: ' ',
-            fg: Color::White,
-            bg: Color::Black,
-        }
-    }
-}
-
-struct Patch {
-    cell: Cell,
-    x: usize,
-    y: usize,
-}
-
-struct Buffer {
-    cells: Vec<Cell>,
-    width: usize,
-    height: usize,
-}
-
-impl Buffer {
-    fn new(width: usize, height: usize) -> Self {
-        let cells = vec![Cell::default(); width * height];
-        Self {
-            cells,
-            width,
-            height,
-        }
-    }
-
-    fn put_cell(&mut self, ch: char, x: usize, y: usize, fg: Color, bg: Color) {
-        let start_index = y * self.width + x;
-        if let Some(cell) = self.cells.get_mut(start_index) {
-            *cell = Cell { ch, fg, bg };
-        }
-    }
-
-    fn put_cells(&mut self, chs: &[char], x: usize, y: usize, fg: Color, bg: Color) {
-        let start_index = y * self.width + x;
-        for (offset, ch) in chs.iter().enumerate() {
-            if let Some(cell) = self.cells.get_mut(start_index + offset) {
-                *cell = Cell { ch: *ch, fg, bg };
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn diff(&mut self, other: &Self) -> Vec<Patch> {
-        assert!(self.width == other.width && self.height == other.height);
-
-        self.cells
-            .iter()
-            .zip(other.cells.iter())
-            .enumerate()
-            .filter(|(_, (a, b))| a != b)
-            .map(|(i, (a, _))| {
-                let x = i % self.width;
-                let y = i / self.width;
-                Patch {
-                    cell: a.clone(),
-                    x,
-                    y,
-                }
-            })
-            .collect()
-    }
-
-    fn clear(&mut self) {
-        self.cells.fill(Cell::default());
-    }
-
-    fn flush(&self, qc: &mut impl Write) -> io::Result<()> {
-        let mut curr_fg_color = Color::White;
-        let mut curr_bg_color = Color::Black;
-        qc.queue(terminal::Clear(terminal::ClearType::All))?;
-        qc.queue(SetForegroundColor(curr_fg_color))?;
-        qc.queue(SetBackgroundColor(curr_bg_color))?;
-        qc.queue(cursor::MoveTo(0, 0))?;
-        for Cell { ch, fg, bg } in self.cells.iter() {
-            if curr_fg_color != *fg {
-                curr_fg_color = *fg;
-                qc.queue(SetForegroundColor(curr_fg_color))?;
-            }
-
-            if curr_bg_color != *bg {
-                curr_bg_color = *bg;
-                qc.queue(SetBackgroundColor(curr_bg_color))?;
-            }
-
-            qc.queue(Print(ch))?;
-        }
-        qc.flush()?;
-        Ok(())
-    }
-}
-
-fn apply_patches(qc: &mut impl QueueableCommand, patches: &[Patch]) -> io::Result<()> {
-    let mut fg_curr = Color::White;
-    let mut bg_curr = Color::Black;
-    let mut x_prev = 0;
-    let mut y_prev = 0;
-    qc.queue(SetForegroundColor(fg_curr))?;
-    qc.queue(SetBackgroundColor(bg_curr))?;
-    for Patch {
-        cell: Cell { ch, fg, bg },
-        x,
-        y,
-    } in patches
-    {
-        if !(y_prev == *y && x_prev + 1 == *x) {
-            qc.queue(cursor::MoveTo(*x as u16, *y as u16))?;
-        }
-        x_prev = *x;
-        y_prev = *y;
-        if fg_curr != *fg {
-            fg_curr = *fg;
-            qc.queue(SetForegroundColor(fg_curr))?;
-        }
-        if bg_curr != *bg {
-            bg_curr = *bg;
-            qc.queue(SetBackgroundColor(bg_curr))?;
-        }
-        qc.queue(Print(ch))?;
-    }
-    Ok(())
-}
 
 #[derive(Default)]
 struct Prompt {
@@ -167,7 +39,7 @@ impl Prompt {
         self.data.clear();
     }
 
-    fn render(&self, buffer: &mut Buffer, x: usize, y: usize, w: usize) {
+    fn render(&self, buffer: &mut TerminalBuffer, x: usize, y: usize, w: usize) {
         let chars = &self.data;
         buffer.put_cells(chars, x, y, Color::White, Color::Black);
 
@@ -207,31 +79,23 @@ impl Prompt {
 
 #[derive(Default)]
 struct ChatLog {
-    data: Vec<String>,
+    items: Vec<(String, Color)>,
 }
 
-// impl Default for ChatLog {
-//     fn default() -> Self {
-//         Self {
-//             data: Vec::<String>::default(),
-//         }
-//     }
-// }
-
 impl ChatLog {
-    fn insert(&mut self, line: String) {
-        self.data.push(line)
+    fn insert(&mut self, message: String, color: Color) {
+        self.items.push((message, color))
     }
 
-    fn render(&self, buffer: &mut Buffer, x: usize, y: usize) {
-        for (dy, line) in self.data.iter().enumerate() {
-            let line_chars: Vec<_> = line.chars().collect();
-            buffer.put_cells(&line_chars, x, y + dy, Color::White, Color::Black);
+    fn render(&self, buffer: &mut TerminalBuffer, x: usize, y: usize) {
+        for (dy, (message, color)) in self.items.iter().enumerate() {
+            let message_chars: Vec<_> = message.chars().collect();
+            buffer.put_cells(&message_chars, x, y + dy, *color, Color::Black);
         }
     }
 }
 
-fn status_bar(buffer: &mut Buffer, label: &str, x: usize, y: usize, w: usize) {
+fn status_bar(buffer: &mut TerminalBuffer, label: &str, x: usize, y: usize, w: usize) {
     let label_chars: Vec<_> = label.chars().collect();
     let n = std::cmp::min(label_chars.len(), w);
 
@@ -242,22 +106,31 @@ fn status_bar(buffer: &mut Buffer, label: &str, x: usize, y: usize, w: usize) {
     }
 }
 
+#[derive(Default)]
+struct Client {
+    stream: Option<TcpStream>,
+    chat: ChatLog,
+    quit: bool,
+}
+
+fn quit_command(client: &mut Client) {
+    client.quit = true;
+}
+
 fn main() -> io::Result<()> {
+    let mut client = Client::default();
     let _screen_state = ScreenState::enable();
     let mut stdout = stdout();
 
-    let mut chat = ChatLog::default();
     let mut prompt = Prompt::default();
 
     let (w, h) = terminal::size()?;
 
-    let mut screen_buffer = Buffer::new(w as usize, h as usize);
-    let mut prev_screen_buffer = Buffer::new(w as usize, h as usize);
-
-    let mut quit = false;
+    let mut screen_buffer = TerminalBuffer::new(w as usize, h as usize);
+    let mut prev_screen_buffer = TerminalBuffer::new(w as usize, h as usize);
 
     prev_screen_buffer.flush(&mut stdout)?;
-    while !quit {
+    while !client.quit {
         if poll(Duration::ZERO)? {
             match read()? {
                 Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
@@ -265,7 +138,7 @@ fn main() -> io::Result<()> {
                         KeyCode::Char(ch) => {
                             if key_event.modifiers == KeyModifiers::CONTROL {
                                 match ch {
-                                    'c' => quit = true,
+                                    'c' => quit_command(&mut client),
                                     'h' => prompt.cursor_move_left(),
                                     'l' => prompt.cursor_move_right(),
                                     _ => (),
@@ -275,8 +148,12 @@ fn main() -> io::Result<()> {
                             }
                         }
                         KeyCode::Enter => {
-                            chat.insert(prompt.get());
-                            prompt.clear();
+                            if client.stream.is_none() {
+                                client.chat.insert("Before sending message you need use /connect <ip> <port> command...".to_string(), Color::Blue);
+                            } else {
+                                client.chat.insert(prompt.get(), Color::White);
+                                prompt.clear();
+                            }
                         }
                         KeyCode::Backspace => {
                             prompt.backspace();
@@ -302,7 +179,7 @@ fn main() -> io::Result<()> {
 
         status_bar(&mut screen_buffer, "simple-chat", 0, 0, w.into());
 
-        chat.render(&mut screen_buffer, 0, 1);
+        client.chat.render(&mut screen_buffer, 0, 1);
 
         if let Some(y) = h.checked_sub(2) {
             status_bar(&mut screen_buffer, "Online", 0, y.into(), w.into())
