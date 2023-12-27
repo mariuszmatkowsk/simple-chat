@@ -17,6 +17,24 @@ use std::io::{self, stdout, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
+macro_rules! chat_msg {
+    ($chat:expr, $($arg:tt)*) => {
+        $chat.insert(format!($($arg)*), Color::White);
+    }
+}
+
+macro_rules! chat_error {
+    ($chat:expr, $($arg:tt)*) => {
+        $chat.insert(format!($($arg)*), Color::Red);
+    }
+}
+
+macro_rules! chat_info {
+    ($chat:expr, $($arg:tt)*) => {
+        $chat.insert(format!($($arg)*), Color::Blue);
+    }
+}
+
 #[derive(Default)]
 struct Prompt {
     data: Vec<char>,
@@ -113,9 +131,97 @@ struct Client {
     quit: bool,
 }
 
-fn quit_command(client: &mut Client) {
+fn connect_command(client: &mut Client, argument: &str) {
+    let ip = argument;
+    if client.stream.is_none() {
+        client.stream = TcpStream::connect(&format!("{ip}:6969")).and_then(|mut stream| {
+            stream.set_nonblocking(true)?;
+            Ok(stream)
+        })
+        .map_err(|err| {
+            chat_error!(&mut client.chat, "Could not connect to {ip}: {err}");
+        })
+        .ok();
+    } else {
+        chat_error!(&mut client.chat, "You are already connected to a server. Disconnect with /disconnect first.");
+    }
+}
+
+fn disconnect_command(client: &mut Client, _argument: &str) {
+    if client.stream.is_some() {
+        client.stream = None;
+        chat_info!(&mut client.chat, "Disconnected.");
+    } else {
+        chat_info!(&mut client.chat, "You are already offline. To connect use /connect <ip>");
+    }
+}
+
+fn quit_command(client: &mut Client, _argument: &str) {
     client.quit = true;
 }
+
+fn help_command(client: &mut Client, argument: &str) {
+    let name = argument.trim();
+    if name.is_empty() {
+        for Command{signature, description, ..} in COMMANDS.iter() {
+            chat_info!(client.chat, "{signature} - {description}");
+        }
+    } else {
+        if let Some(Command{signature, description, ..}) = find_command(name) {
+            chat_info!(client.chat, "{signature} - {description}");
+        } else {
+            chat_error!(client.chat, "Unknown command `/{name}`");
+        }
+    }
+}
+
+
+struct Command {
+    name: &'static str,
+    description: &'static str,
+    signature: &'static str,
+    run: fn(&mut Client, &str),
+}
+
+const COMMANDS: &[Command] = &[
+    Command {
+        name: "connect",
+        run: connect_command,
+        description: "Connect to a server by <ip>",
+        signature: "/connect <ip>",
+    },
+    Command {
+        name: "disconnect",
+        run: disconnect_command,
+        description: "Disconnect from the server which one you are currently connected to",
+        signature: "/disconnect",
+    },
+    Command {
+        name: "quit",
+        run: quit_command,
+        description: "Close the chat",
+        signature: "/quit",
+    },
+    Command {
+        name: "help",
+        run: help_command,
+        description: "Print help",
+        signature: "/help [command]",
+    },
+];
+
+fn find_command(name: &str) -> Option<&Command> {
+    COMMANDS.iter().find(|command| command.name == name)
+}
+
+fn parse_prompt(prompt: &[char]) -> Option<(&[char], &[char])> {
+    let prompt = prompt.strip_prefix(&['/'])?;
+    let mut iter = prompt.splitn(2, |x| *x == ' ');
+    let a = iter.next().unwrap_or(prompt);
+    let b = iter.next().unwrap_or(&[]);
+    Some((a, b))
+}
+
 
 fn main() -> io::Result<()> {
     let mut client = Client::default();
@@ -138,7 +244,7 @@ fn main() -> io::Result<()> {
                         KeyCode::Char(ch) => {
                             if key_event.modifiers == KeyModifiers::CONTROL {
                                 match ch {
-                                    'c' => quit_command(&mut client),
+                                    'c' => quit_command(&mut client, ""),
                                     'h' => prompt.cursor_move_left(),
                                     'l' => prompt.cursor_move_right(),
                                     _ => (),
@@ -148,6 +254,28 @@ fn main() -> io::Result<()> {
                             }
                         }
                         KeyCode::Enter => {
+                            if let Some((command, argument)) = parse_prompt(&prompt.data) {
+                                let command_name: String = command.iter().collect();
+                                let argument: String = argument.iter().collect();
+                                if let Some(command) = find_command(&command_name) {
+                                    (command.run)(&mut client, &argument);
+                                } else {
+                                    chat_error!(&mut client.chat, "Unknown command `/{command_name}`");
+                                }
+                            } else {
+                                if let Some(ref mut stream) = &mut client.stream {
+                                    let prompt: String = prompt.data.iter().collect();
+                                    stream.write(prompt.as_bytes())?;
+                                    chat_msg!(&mut client.chat, "{text}", text=&prompt);
+                                } else {
+                                    chat_info!(
+                                        &mut client.chat,
+                                        "You are offline. Use {signature} to connect to a server.",
+                                            signature = find_command("connect").expect("connect command").signature);
+                                }
+                            }
+
+
                             if client.stream.is_none() {
                                 client.chat.insert("Before sending message you need use /connect <ip> <port> command...".to_string(), Color::Blue);
                             } else {
